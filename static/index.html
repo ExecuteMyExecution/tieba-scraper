@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="百度贴吧内容抓取与筛选工具">
+  <title>贴吧内容采集台</title>
+  <link rel="stylesheet" href="/static/styles.css?v=14">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="贴吧内容采集台首页">
+        <span class="brand-mark">帖</span>
+        <span>贴吧内容采集台</span>
+      </a>
+      <div class="service-state"><span class="live-dot"></span> 本地服务已连接</div>
+    </header>
+
+    <section class="hero">
+      <div>
+        <span class="eyebrow">TIEBA CONTENT DESK</span>
+        <h1>把散落的帖子，<br><em>收拢成可筛选的资料。</em></h1>
+        <p>按吧名和时间批量采集主题首楼，在一个干净的工作台里搜索、排序、查看图片与原帖。</p>
+      </div>
+      <div class="stats" aria-label="内容统计">
+        <div><strong id="stat-total">0</strong><span>已收录</span></div>
+        <div><strong id="stat-forums">0</strong><span>贴吧</span></div>
+        <div><strong id="stat-images">0</strong><span>含图片</span></div>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <aside class="panel collector-panel">
+        <button class="collector-toggle" id="collector-toggle" type="button" aria-expanded="true" aria-controls="collector-content" title="收起采集栏"><span>←</span><b>收起</b></button>
+        <div class="collector-rail" aria-hidden="true"><span>01</span><b>采集</b></div>
+        <div class="collector-content" id="collector-content">
+          <div class="panel-heading">
+            <span class="step-number">01</span>
+            <div><h2>新建采集</h2><p>设置本次抓取范围</p></div>
+          </div>
+          <form id="crawl-form">
+          <label class="field">
+            <span>贴吧名称</span>
+            <div class="input-affix"><input id="forum-name" name="forum_name" placeholder="例如：摄影" required maxlength="64"><b>吧</b></div>
+          </label>
+          <label class="field">
+            <span>抓取页数</span>
+            <div class="range-row">
+              <input id="pages" name="pages" type="range" min="1" max="100" value="3">
+              <output id="pages-output" for="pages">3 页</output>
+            </div>
+            <small>每页约 30 个主题，最多 100 页，建议从少量开始</small>
+          </label>
+          <div class="date-grid">
+            <label class="field"><span>开始日期</span><input id="start-date" name="start_date" type="date"></label>
+            <label class="field"><span>结束日期</span><input id="end-date" name="end_date" type="date"></label>
+          </div>
+          <fieldset class="image-condition">
+            <legend>首楼图片条件</legend>
+            <div class="segmented-control">
+              <label><input type="radio" name="image_condition" value="all" checked><span>不限</span></label>
+              <label><input type="radio" name="image_condition" value="with_images"><span>有图片</span></label>
+              <label><input type="radio" name="image_condition" value="without_images"><span>无图片</span></label>
+              <label><input type="radio" name="image_condition" value="portrait_images"><span>人像</span></label>
+            </div>
+            <small>“人像”会识别人脸及人体，包含遮脸、背影和身体特写（速度较慢）</small>
+          </fieldset>
+          <button class="primary-button" id="crawl-button" type="submit"><span>开始采集</span><b>↗</b></button>
+          </form>
+
+          <div class="job-box hidden" id="job-box" aria-live="polite">
+            <div class="job-title"><span id="job-status">准备中</span><b id="job-percent">0%</b></div>
+            <div class="progress-track"><i id="job-progress"></i></div>
+            <p id="job-message">正在创建任务…</p>
+            <p class="job-metrics" id="job-metrics">首楼缓存 0 条 · 图片缓存 0 张 · 图片失败 0 张 · 自动重试 0 次 · 跳过 0 条 · 未完成 0 条</p>
+            <div class="job-actions"><button id="cancel-job-button" type="button">取消任务</button></div>
+          </div>
+        </div>
+      </aside>
+
+      <section class="panel library-panel">
+        <div class="panel-heading library-heading">
+          <span class="step-number">02</span>
+          <div><h2>内容资料库</h2><p id="result-summary">浏览已采集内容</p></div>
+          <div class="library-actions">
+            <button class="ghost-button" id="refresh-button" type="button">刷新内容</button>
+          </div>
+        </div>
+
+        <form class="filters" id="filter-form">
+          <label class="search-field"><span>⌕</span><input id="query" placeholder="搜索标题或正文…"></label>
+          <select id="filter-forum" aria-label="贴吧筛选"><option value="">全部贴吧</option></select>
+          <input id="filter-author" aria-label="作者" placeholder="作者">
+          <select id="filter-images" aria-label="图片筛选"><option value="all">全部内容</option><option value="yes">仅含图片</option><option value="no">不含图片</option></select>
+          <select id="filter-sort" aria-label="内容排序"><option value="newest">最新发布</option><option value="oldest">最早发布</option><option value="replies">回复最多</option><option value="views">浏览最多</option></select>
+          <button class="filter-reset" id="filter-reset" type="button">重置</button>
+        </form>
+        <section class="ignored-authors hidden" id="ignored-authors" aria-label="不看作者名单"></section>
+
+        <div class="results-toolbar">
+          <div class="card-size-control" id="card-size-control" role="group" aria-label="卡片大小">
+            <span>卡片大小</span>
+            <button id="card-size-smaller" type="button" aria-label="缩小卡片" aria-keyshortcuts="-" title="快捷键：-">−</button>
+            <input id="card-size-range" type="range" min="180" max="360" step="10" value="220" aria-label="调整卡片大小">
+            <button id="card-size-larger" type="button" aria-label="放大卡片" aria-keyshortcuts="+" title="快捷键：+">＋</button>
+            <output id="card-size-output" for="card-size-range">220px</output>
+          </div>
+          <span class="view-label">展示方式</span>
+          <div class="view-switch" role="group" aria-label="内容展示方式">
+            <button class="active" id="grid-view-button" type="button" aria-pressed="true" title="卡片视图">▦ <span>卡片</span></button>
+            <button id="list-view-button" type="button" aria-pressed="false" title="列表视图">☷ <span>列表</span></button>
+          </div>
+        </div>
+        <div class="content-list grid-view" id="content-list"></div>
+        <div class="empty-state hidden" id="empty-state"><span>⌁</span><h3>还没有匹配的内容</h3><p>调整筛选条件，或从左侧开始一次新的采集。</p></div>
+        <nav class="pagination hidden" id="pagination" aria-label="内容分页">
+          <label class="page-size-control" for="page-size">
+            <span>每页</span>
+            <select id="page-size" aria-label="每页帖子数量">
+              <option value="12" selected>12 条</option>
+              <option value="24">24 条</option>
+              <option value="48">48 条</option>
+              <option value="96">96 条</option>
+            </select>
+          </label>
+          <div class="page-controls">
+            <button id="prev-page" type="button" aria-keyshortcuts="ArrowLeft" title="快捷键：←">← 上一页</button>
+            <label class="page-select-control" for="page-select">
+              <span>第</span>
+              <select id="page-select" aria-label="选择页码"></select>
+              <span id="page-info"></span>
+            </label>
+            <button id="next-page" type="button" aria-keyshortcuts="ArrowRight" title="快捷键：→">下一页 →</button>
+          </div>
+          <span class="page-range" id="page-range"></span>
+        </nav>
+      </section>
+    </section>
+  </main>
+  <div class="lightbox hidden" id="lightbox" role="dialog" aria-modal="true" aria-label="图片大图预览">
+    <button class="lightbox-mask" id="lightbox-mask" type="button" aria-label="关闭大图预览"></button>
+    <div class="lightbox-dialog">
+      <button class="lightbox-close" id="lightbox-close" type="button" aria-label="关闭">×</button>
+      <button class="lightbox-arrow lightbox-prev" id="lightbox-prev" type="button" aria-label="上一张">‹</button>
+      <img id="lightbox-image" alt="帖子大图">
+      <button class="lightbox-arrow lightbox-next" id="lightbox-next" type="button" aria-label="下一张">›</button>
+      <div class="lightbox-counter" id="lightbox-counter"></div>
+    </div>
+  </div>
+  <div class="toast hidden" id="toast" role="alert"></div>
+  <script src="/static/app.js?v=16" defer></script>
+</body>
+</html>
