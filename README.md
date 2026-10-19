@@ -30,34 +30,28 @@
 
 建议使用 Python 3.10 或更高版本。
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
-
-打开 <http://127.0.0.1:8000>。
-
-Windows 下也可以直接在项目目录运行：
-
-```powershell
-.\start.ps1
-```
-
-首次运行时，脚本会自动创建虚拟环境并安装依赖。
-
-使用 Git Bash 时运行：
+使用 Git Bash 或 WSL 时，在项目目录运行：
 
 ```bash
 bash start.sh
 ```
 
+首次运行时，脚本会自动创建虚拟环境并安装依赖；之后如果依赖缺失，也会自动补装。启动后打开 <http://127.0.0.1:8000>。
+
+在 WSL / Ubuntu 中首次运行前，请确认已安装 venv 组件：
+
+```bash
+sudo apt install -y python3-venv
+```
+
+否则 `python3 -m venv` 可能留下一个没有 pip 的空 `.venv`，启动时会报 `No module named uvicorn`。
+
 ## 测试
 
-```powershell
-pip install -r requirements-dev.txt
-pytest -q --basetemp .pytest_tmp
+```bash
+# WSL
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q --basetemp .pytest_tmp
 ```
 
 ## 说明
