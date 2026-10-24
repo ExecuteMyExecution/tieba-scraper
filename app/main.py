@@ -66,12 +66,12 @@ async def start_crawl(request: CrawlRequest):
 
 
 @app.get("/api/jobs")
-async def jobs():
+def jobs():
     return {"items": database.list_jobs()}
 
 
 @app.get("/api/jobs/{job_id}")
-async def job(job_id: int):
+def job(job_id: int):
     result = database.get_job(job_id)
     if result is None:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -94,7 +94,7 @@ async def cancel_job(job_id: int):
 
 
 @app.get("/api/threads")
-async def threads(
+def threads(
     query: str = Query(default="", max_length=100),
     forum: str = Query(default="", max_length=64),
     author: str = Query(default="", max_length=64),
@@ -105,6 +105,7 @@ async def threads(
     sort: str = Query(default="newest", pattern="^(newest|oldest|replies|views)$"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
+    anchor_tid: int | None = Query(default=None, ge=1),
 ):
     excluded_authors = list(dict.fromkeys(
         value.strip() for value in exclude_author
@@ -119,14 +120,15 @@ async def threads(
         start_date=start_date.isoformat() if start_date else "",
         end_date=end_date.isoformat() if end_date else "",
         sort=sort, page=page, page_size=page_size,
+        anchor_tid=anchor_tid,
     )
 
 
 @app.get("/api/stats")
-async def stats():
+def stats():
     return database.get_stats()
 
 
 @app.get("/api/forums")
-async def forums():
+def forums():
     return {"items": database.list_forums()}

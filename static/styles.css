@@ -46,7 +46,7 @@ h1 em { color: var(--green); font-family: Georgia, "Noto Serif SC", serif; font-
 .stats span { margin-top: 3px; color: var(--muted); font-size: 12px; }
 .workspace { display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 18px; align-items: start; transition: grid-template-columns .28s ease; }
 .workspace.collector-collapsed { grid-template-columns: 62px minmax(0, 1fr); }
-.panel { background: var(--paper); border: 1px solid rgba(23, 33, 28, .09); border-radius: 20px; box-shadow: var(--shadow); backdrop-filter: blur(14px); }
+.panel { background: var(--paper); border: 1px solid rgba(23, 33, 28, .09); border-radius: 20px; box-shadow: var(--shadow); }
 .collector-panel { position: sticky; top: 20px; padding: 27px; overflow: hidden; transition: padding .28s ease, min-height .28s ease; }
 .collector-toggle { position: absolute; z-index: 2; top: 25px; right: 22px; display: flex; align-items: center; gap: 5px; height: 30px; padding: 0 8px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: white; font-size: 10px; }
 .collector-toggle b { font-weight: 600; }
@@ -130,8 +130,8 @@ input[type="range"] { height: 6px; padding: 0; accent-color: var(--green); borde
 .content-list { --card-min-width: 220px; --preview-width: 106px; --preview-height: 84px; display: grid; gap: 10px; scroll-margin-top: 16px; transition: opacity .2s; }
 .content-list.grid-view { grid-template-columns: repeat(auto-fill, var(--card-min-width)); justify-content: start; align-items: stretch; }
 .content-list.list-view { grid-template-columns: 1fr; }
-.content-card { min-width: 0; height: 100%; display: flex; flex-direction: column; padding: 16px; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.68); transition: .2s; }
-.content-card:hover { border-color: #bdcbbf; transform: translateY(-1px); box-shadow: 0 10px 24px rgba(24,45,32,.05); }
+.content-card { min-width: 0; height: 100%; display: flex; flex-direction: column; padding: 16px; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.68); transition: border-color .2s ease, background-color .2s ease; }
+.content-card:hover { border-color: #bdcbbf; background: rgba(255,255,255,.82); }
 .card-top, .card-meta, .card-actions { display: flex; align-items: center; }
 .card-top { gap: 8px; }
 .forum-pill, .image-pill { padding: 4px 8px; border-radius: 20px; font-size: 9px; font-weight: 700; }
@@ -142,11 +142,11 @@ input[type="range"] { height: 6px; padding: 0; accent-color: var(--green); borde
 .content-card > p { margin: 0; display: -webkit-box; overflow: hidden; -webkit-line-clamp: 3; -webkit-box-orient: vertical; color: #626b65; font-size: 12px; line-height: 1.7; white-space: pre-wrap; }
 .image-strip { display: flex; gap: 8px; margin-top: 13px; padding-bottom: 3px; overflow-x: auto; }
 .image-preview { flex: 0 0 auto; padding: 0; border: 0; border-radius: 9px; background: var(--cream); cursor: zoom-in; overflow: hidden; }
-.image-preview img { display: block; width: var(--preview-width); height: var(--preview-height); object-fit: cover; transition: transform .2s ease; }
+.image-preview img { display: block; width: var(--preview-width); height: var(--preview-height); object-fit: cover; }
 .grid-view .image-preview { flex-basis: calc((100% - 8px) / 2); }
 .grid-view .image-preview:only-child { flex-basis: 72%; }
 .grid-view .image-preview img { width: 100%; height: auto; aspect-ratio: 53 / 42; }
-.image-preview:hover img { transform: scale(1.05); }
+.image-preview:hover { outline: 2px solid rgba(37, 106, 75, .55); outline-offset: -2px; }
 .card-footer { display: flex; justify-content: space-between; gap: 12px; margin-top: auto; padding-top: 14px; border-top: 1px solid #ebeeeb; }
 .card-meta { gap: 9px; flex-wrap: wrap; color: #858d87; font-size: 9px; }
 .card-meta strong { color: #4f5952; font-weight: 600; }
@@ -175,12 +175,14 @@ input[type="range"] { height: 6px; padding: 0; accent-color: var(--green); borde
 .pagination span { color: var(--muted); font-size: 11px; }
 .page-range { justify-self: end; white-space: nowrap; }
 .toast { position: fixed; right: 24px; bottom: 24px; max-width: 360px; padding: 13px 16px; color: white; background: var(--ink); border-radius: 10px; box-shadow: 0 12px 35px rgba(0,0,0,.16); font-size: 12px; }
-body.lightbox-open { overflow: hidden; }
-.lightbox { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 64px 92px 72px; }
-.lightbox-mask { position: absolute; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; background: rgba(8, 14, 11, .88); cursor: zoom-out; backdrop-filter: blur(10px); }
+.lightbox { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 64px 92px 72px; overscroll-behavior: contain; }
+.lightbox-mask { position: absolute; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; background: rgba(8, 14, 11, .94); cursor: zoom-out; touch-action: none; }
 .lightbox-dialog { position: relative; z-index: 1; display: grid; place-items: center; min-width: 0; min-height: 0; width: min(calc(100vw - 184px), 1280px); height: min(calc(100vh - 136px), 900px); pointer-events: none; }
 .lightbox-dialog img { display: block; width: auto; height: auto; max-width: calc(100vw - 220px); max-height: calc(100vh - 160px); object-fit: contain; border-radius: 12px; box-shadow: 0 24px 80px rgba(0,0,0,.38); pointer-events: auto; }
-.lightbox-close, .lightbox-arrow { position: absolute; z-index: 2; display: grid; place-items: center; border: 1px solid rgba(255,255,255,.2); color: white; background: rgba(20,29,24,.65); pointer-events: auto; backdrop-filter: blur(8px); transition: .18s; }
+.lightbox-dialog img.loading { opacity: 0; }
+.lightbox-dialog.loading::after { content: ""; position: absolute; z-index: 2; top: calc(50% - 17px); left: calc(50% - 17px); width: 34px; height: 34px; border: 3px solid rgba(255,255,255,.28); border-top-color: #fff; border-radius: 50%; animation: lightbox-spin .75s linear infinite; pointer-events: none; }
+@keyframes lightbox-spin { to { transform: rotate(360deg); } }
+.lightbox-close, .lightbox-arrow { position: absolute; z-index: 2; display: grid; place-items: center; border: 1px solid rgba(255,255,255,.2); color: white; background: rgba(20,29,24,.72); pointer-events: auto; transition: background-color .18s; }
 .lightbox-close:hover, .lightbox-arrow:hover { background: var(--green); }
 .lightbox-close { top: -50px; right: -56px; width: 40px; height: 40px; border-radius: 50%; font-size: 25px; }
 .lightbox-arrow { top: 50%; width: 46px; height: 62px; border-radius: 12px; transform: translateY(-50%); font-size: 38px; }

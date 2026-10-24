@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from datetime import date
 from types import SimpleNamespace
 
@@ -37,8 +38,8 @@ def test_image_urls_prefers_original_and_deduplicates():
     )
     assert crawler._image_urls(contents) == ["original.jpg", "second.jpg"]
     assert crawler._image_entries(contents) == [
-        ("original.jpg", "original.jpg"),
-        ("second.jpg", "second.jpg"),
+        ("original.jpg", "small.jpg"),
+        ("second.jpg", "small2.jpg"),
     ]
 
 
@@ -100,12 +101,16 @@ def test_database_upsert_and_search(tmp_path, monkeypatch):
         "created_at": 1_780_000_000, "last_reply_at": 1_780_000_100,
         "reply_count": 12, "view_count": 300, "agree_count": 5,
         "has_images": True, "images": ["https://example.com/a.jpg"],
+        "image_thumbs": ["https://example.com/a-thumb.jpg"],
         "source_url": "https://tieba.baidu.com/p/123", "job_id": job_id,
     })
     result = database.search_threads(query="倒影", has_images="yes")
     assert result["total"] == 1
     assert result["items"][0]["title"] == "雨天散步"
     assert result["items"][0]["images"] == ["https://example.com/a.jpg"]
+    assert result["items"][0]["image_thumbs"] == [
+        "https://example.com/a-thumb.jpg"
+    ]
     database.upsert_thread({
         "tid": 124, "forum_name": "摄影", "title": "晴天散步",
         "content": "城市里的阳光", "author_name": "路人", "author_id": 8,
@@ -117,6 +122,146 @@ def test_database_upsert_and_search(tmp_path, monkeypatch):
     excluded = database.search_threads(exclude_authors=["旅人"])
     assert excluded["total"] == 1
     assert excluded["items"][0]["author_name"] == "路人"
+
+
+def test_anchor_tid_keeps_position_after_excluding_author(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "anchor.db")
+    database.initialize()
+    job_id = database.create_job({
+        "forum_name": "摄影", "pages": 1, "first_floor_image_filter": "all",
+        "start_date": None, "end_date": None,
+    })
+    for tid in range(1, 11):
+        database.upsert_thread({
+            "tid": tid, "forum_name": "摄影", "title": f"主题{tid}",
+            "content": "正文",
+            "author_name": "隐藏作者" if tid in (1, 2) else f"作者{tid}",
+            "author_id": tid, "created_at": tid, "last_reply_at": 0,
+            "reply_count": 0, "view_count": 0, "agree_count": 0,
+            "has_images": False, "images": [],
+            "source_url": f"https://tieba.baidu.com/p/{tid}", "job_id": job_id,
+        })
+
+    anchored = database.search_threads(
+        sort="oldest", page=1, page_size=3, anchor_tid=8
+    )
+    assert anchored["page"] == 3
+    assert [item["tid"] for item in anchored["items"]] == [7, 8, 9]
+
+    # Two earlier posts are filtered out, so the same anchor moves to page 2.
+    filtered = database.search_threads(
+        sort="oldest", page=1, page_size=3,
+        exclude_authors=["隐藏作者"], anchor_tid=8,
+    )
+    assert filtered["page"] == 2
+    assert [item["tid"] for item in filtered["items"]] == [6, 7, 8]
+
+    # An anchor that is itself filtered out falls back to the requested page.
+    missing = database.search_threads(
+        sort="oldest", page=1, page_size=3,
+        exclude_authors=["隐藏作者"], anchor_tid=2,
+    )
+    assert missing["page"] == 1
+    assert [item["tid"] for item in missing["items"]] == [3, 4, 5]
+
+
+def test_publish_preserves_failed_threads_and_creates_backup(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "preserve.db")
+    database.initialize()
+    old_job = database.create_job({
+        "forum_name": "摄影", "pages": 1, "first_floor_image_filter": "all",
+        "start_date": None, "end_date": None,
+    })
+    for tid in (1, 2):
+        database.upsert_thread({
+            "tid": tid, "forum_name": "摄影", "title": f"旧主题{tid}",
+            "content": "旧正文", "author_name": "作者", "author_id": 1,
+            "created_at": tid, "last_reply_at": 0, "reply_count": 0,
+            "view_count": 0, "agree_count": 0, "has_images": False,
+            "images": [], "source_url": f"https://tieba.baidu.com/p/{tid}",
+            "job_id": old_job,
+        })
+
+    new_job = database.create_job({
+        "forum_name": "摄影", "pages": 1, "first_floor_image_filter": "all",
+        "start_date": None, "end_date": None,
+    })
+    database.stage_threads(new_job, [{
+        "tid": 1, "forum_name": "摄影", "title": "新主题1",
+        "content": "新正文", "author_name": "作者", "author_id": 1,
+        "created_at": 1, "last_reply_at": 0, "reply_count": 0,
+        "view_count": 0, "agree_count": 0, "has_images": False,
+        "images": [], "source_url": "https://tieba.baidu.com/p/1",
+        "job_id": new_job,
+    }])
+
+    assert database.publish_job_threads(new_job, "all", preserve_tids={2}) == 1
+    visible = {item["tid"]: item for item in database.search_threads()["items"]}
+    assert set(visible) == {1, 2}
+    assert visible[1]["title"] == "新主题1"
+    assert visible[2]["title"] == "旧主题2"
+    backups = list((tmp_path / "backups").glob("auto-preserve-*.db"))
+    assert len(backups) == 1
+    with sqlite3.connect(backups[0]) as backup_db:
+        backup_title = backup_db.execute(
+            "SELECT title FROM threads WHERE tid=1"
+        ).fetchone()[0]
+    assert backup_title == "旧主题1"
+
+
+def test_publish_refuses_to_replace_existing_data_with_empty_filter(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "empty-filter.db")
+    database.initialize()
+    old_job = database.create_job({
+        "forum_name": "摄影", "pages": 1, "first_floor_image_filter": "all",
+        "start_date": None, "end_date": None,
+    })
+    database.upsert_thread({
+        "tid": 1, "forum_name": "摄影", "title": "旧主题", "content": "旧正文",
+        "author_name": "作者", "author_id": 1, "created_at": 1,
+        "last_reply_at": 0, "reply_count": 0, "view_count": 0, "agree_count": 0,
+        "has_images": True, "images": ["https://example.com/a.jpg"],
+        "source_url": "https://tieba.baidu.com/p/1", "job_id": old_job,
+    })
+    new_job = database.create_job({
+        "forum_name": "摄影", "pages": 1, "first_floor_image_filter": "with_images",
+        "start_date": None, "end_date": None,
+    })
+    database.stage_threads(new_job, [{
+        "tid": 2, "forum_name": "摄影", "title": "无图主题", "content": "正文",
+        "author_name": "作者", "author_id": 1, "created_at": 2,
+        "last_reply_at": 0, "reply_count": 0, "view_count": 0, "agree_count": 0,
+        "has_images": False, "images": [],
+        "source_url": "https://tieba.baidu.com/p/2", "job_id": new_job,
+    }])
+
+    with pytest.raises(ValueError, match="没有可发布"):
+        database.publish_job_threads(new_job, "with_images")
+    visible = database.search_threads(forum="摄影")
+    assert visible["total"] == 1
+    assert visible["items"][0]["tid"] == 1
+
+
+def test_forum_filter_is_exact_and_uses_indexed_equality(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "forum-exact.db")
+    database.initialize()
+    job_id = database.create_job({
+        "forum_name": "摄影", "pages": 1, "first_floor_image_filter": "all",
+        "start_date": None, "end_date": None,
+    })
+    for tid, forum in [(1, "摄影"), (2, "摄影技术")]:
+        database.upsert_thread({
+            "tid": tid, "forum_name": forum, "title": f"主题{tid}",
+            "content": "正文", "author_name": "作者", "author_id": 1,
+            "created_at": tid, "last_reply_at": 0, "reply_count": 0,
+            "view_count": 0, "agree_count": 0, "has_images": False,
+            "images": [], "source_url": f"https://tieba.baidu.com/p/{tid}",
+            "job_id": job_id,
+        })
+    result = database.search_threads(forum="摄影")
+    assert [item["tid"] for item in result["items"]] == [1]
 
 
 def test_pagination_is_stable_when_posts_share_the_same_timestamp(tmp_path, monkeypatch):
@@ -205,16 +350,18 @@ def test_portrait_publish_uses_the_same_unfiltered_job_snapshot(tmp_path, monkey
     assert visible["total"] == 1
     assert visible["items"][0]["tid"] == 10
     assert visible["items"][0]["images"] == ["https://example.com/b.jpg"]
+    assert visible["items"][0]["image_thumbs"] == ["https://example.com/b.jpg"]
 
     with database.connect() as db:
         snapshot = db.execute(
-            "SELECT images_json, portrait_images_json FROM job_threads "
-            "WHERE job_id=? AND tid=10", (job_id,),
+            "SELECT images_json, portrait_images_json, portrait_thumbs_json "
+            "FROM job_threads WHERE job_id=? AND tid=10", (job_id,),
         ).fetchone()
     assert snapshot["images_json"] == (
         '["https://example.com/a.jpg", "https://example.com/b.jpg"]'
     )
     assert snapshot["portrait_images_json"] == '["https://example.com/b.jpg"]'
+    assert snapshot["portrait_thumbs_json"] == '["https://example.com/b.jpg"]'
 
 
 def test_publish_keeps_latest_snapshot_per_forum(tmp_path, monkeypatch):
@@ -300,7 +447,12 @@ def test_portrait_crawl_classifies_one_fixed_snapshot(tmp_path, monkeypatch):
             return Result(source_threads)
 
         async def get_posts(self, tid, **_kwargs):
-            images = [SimpleNamespace(origin_src=url, big_src="", src="") for url in image_urls[tid]]
+            images = [
+                SimpleNamespace(
+                    origin_src=url, big_src="", src=url.replace(".jpg", "-thumb.jpg")
+                )
+                for url in image_urls[tid]
+            ]
             post = SimpleNamespace(
                 floor=1, contents=SimpleNamespace(imgs=images, text="正文"),
                 text="正文", user=SimpleNamespace(show_name=f"作者{tid}"),
@@ -331,13 +483,19 @@ def test_portrait_crawl_classifies_one_fixed_snapshot(tmp_path, monkeypatch):
     assert visible["total"] == 1
     assert visible["items"][0]["tid"] == 20
     assert visible["items"][0]["images"] == ["https://example.com/b.jpg"]
+    assert visible["items"][0]["image_thumbs"] == [
+        "https://example.com/b-thumb.jpg"
+    ]
     with database.connect() as db:
         assert db.execute(
             "SELECT COUNT(*) FROM job_threads WHERE job_id=?", (job_id,)
         ).fetchone()[0] == 2
 
 
-def test_detail_429_is_retried_with_backoff():
+def test_detail_429_is_retried_with_backoff(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "retry.db")
+    database.initialize()
+
     class Result(list):
         def __init__(self, values=(), error=None):
             super().__init__(values)
@@ -375,6 +533,18 @@ def test_detail_429_is_retried_with_backoff():
 def test_unrecovered_detail_failure_marks_job_partial(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DB_PATH", tmp_path / "partial.db")
     database.initialize()
+    old_job = database.create_job({
+        "forum_name": "摄影", "pages": 1, "first_floor_image_filter": "all",
+        "start_date": None, "end_date": None,
+    })
+    database.upsert_thread({
+        "tid": 2, "forum_name": "摄影", "title": "旧数据",
+        "content": "旧正文", "author_name": "作者2", "author_id": 2,
+        "created_at": 2, "last_reply_at": 0, "reply_count": 0,
+        "view_count": 0, "agree_count": 0, "has_images": False,
+        "images": [], "source_url": "https://tieba.baidu.com/p/2",
+        "job_id": old_job,
+    })
     request = CrawlRequest(forum_name="摄影", pages=1)
     job_id = database.create_job(request.model_dump(mode="json"))
 
@@ -423,7 +593,9 @@ def test_unrecovered_detail_failure_marks_job_partial(tmp_path, monkeypatch):
     assert job["status"] == "partial"
     assert job["failed_count"] == 1
     assert job["retry_count"] == 2
-    assert database.search_threads()["total"] == 1
+    visible = {item["tid"]: item for item in database.search_threads()["items"]}
+    assert set(visible) == {1, 2}
+    assert visible[2]["title"] == "旧数据"
 
 
 def test_recent_thread_detail_cache_avoids_network_request(tmp_path, monkeypatch):
@@ -717,6 +889,51 @@ def test_crawl_deduplicates_pages_and_stops_after_start_date(tmp_path, monkeypat
     assert job["status"] == "completed"
     assert job["found_count"] == 2
     assert database.search_threads()["total"] == 2
+
+
+def test_empty_crawl_preserves_previous_forum_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "empty-crawl.db")
+    database.initialize()
+    old_job = database.create_job({
+        "forum_name": "摄影", "pages": 1, "first_floor_image_filter": "all",
+        "start_date": None, "end_date": None,
+    })
+    database.upsert_thread({
+        "tid": 99, "forum_name": "摄影", "title": "上一次结果",
+        "content": "仍应保留", "author_name": "作者", "author_id": 1,
+        "created_at": 1, "last_reply_at": 1, "reply_count": 0,
+        "view_count": 0, "agree_count": 0, "has_images": False,
+        "images": [], "source_url": "https://tieba.baidu.com/p/99",
+        "job_id": old_job,
+    })
+
+    request = CrawlRequest(forum_name="摄影", pages=1)
+    job_id = database.create_job(request.model_dump(mode="json"))
+
+    class Result(list):
+        err = None
+
+    class EmptyClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def get_threads(self, *_args, **_kwargs):
+            return Result()
+
+    worker = crawler.TiebaCrawler(
+        client_factory=EmptyClient, detail_request_interval=0
+    )
+    asyncio.run(worker.run(job_id, request))
+
+    job = database.get_job(job_id)
+    assert job["status"] == "failed"
+    assert "保留" in job["message"]
+    visible = database.search_threads(forum="摄影")
+    assert visible["total"] == 1
+    assert visible["items"][0]["tid"] == 99
 
 
 def test_cancelling_crawl_preserves_previous_forum_snapshot(tmp_path, monkeypatch):

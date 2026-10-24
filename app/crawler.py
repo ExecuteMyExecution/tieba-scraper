@@ -41,24 +41,34 @@ def _timestamp_bounds(request: CrawlRequest) -> tuple[int | None, int | None]:
 
 
 def _image_urls(contents: Any) -> list[str]:
-    return [display_url for display_url, _ in _image_entries(contents)]
+    return [origin_url for origin_url, _ in _image_entries(contents)]
 
 
 def _image_entries(contents: Any) -> list[tuple[str, str]]:
+    """Return unique ``(original, thumbnail)`` pairs for first-floor images.
+
+    The original URL is kept for the lightbox and for portrait detection, which
+    needs full-resolution pixels. The grid preview uses Tieba's 720px CDN
+    thumbnail whenever the API provides one: loading a 4000px original into a
+    100px card costs a lot of bandwidth and image decoding time.
+    """
     result: list[str] = []
     entries: list[tuple[str, str]] = []
     for image in getattr(contents, "imgs", []) or []:
-        display_url = (
+        origin_url = (
             getattr(image, "origin_src", "")
             or getattr(image, "big_src", "")
             or getattr(image, "src", "")
         )
-        # Portrait detection needs the original pixels; medium thumbnails can
-        # shrink faces in collages below the detector's usable size.
-        detection_url = display_url
-        if display_url and display_url not in result:
-            result.append(display_url)
-            entries.append((display_url, detection_url))
+        if not origin_url or origin_url in result:
+            continue
+        thumbnail_url = (
+            getattr(image, "src", "")
+            or getattr(image, "big_src", "")
+            or origin_url
+        )
+        result.append(origin_url)
+        entries.append((origin_url, thumbnail_url))
     return entries
 
 
@@ -379,6 +389,8 @@ class TiebaCrawler:
                     )
                     if reached_start_boundary:
                         break
+                    if not getattr(threads, "has_more", True):
+                        break
                     if page_number < request.pages:
                         await asyncio.sleep(0.45)
 
@@ -430,6 +442,9 @@ class TiebaCrawler:
                         )
 
             final_failed = len(failed_threads)
+            existing_count = database.count_forum_threads(request.forum_name)
+            if found == 0 and existing_count:
+                raise RuntimeError("未找到符合条件的主题，已保留该吧上一次数据")
             if found and not snapshot and final_failed:
                 raise RuntimeError("所有主题首楼均请求失败，已保留上一次页面数据")
 
@@ -473,11 +488,21 @@ class TiebaCrawler:
                     url for url, is_portrait in cached_portraits.items() if is_portrait
                 } | new_matches
                 portrait_matches: dict[int, list[str]] = {}
+                portrait_thumbs: dict[int, list[str]] = {}
                 for tid, record in snapshot.items():
                     matched = [url for url in record["images"] if url in matched_urls]
                     portrait_matches[tid] = matched
+                    thumb_by_url = dict(zip(
+                        record["images"],
+                        record.get("image_thumbs") or record["images"],
+                    ))
+                    portrait_thumbs[tid] = [
+                        thumb_by_url.get(url, url) for url in matched
+                    ]
                     record["is_portrait"] = bool(matched)
-                database.set_portrait_matches(job_id, portrait_matches)
+                database.set_portrait_matches(
+                    job_id, portrait_matches, portrait_thumbs
+                )
                 database.update_job(
                     job_id,
                     progress=98,
@@ -488,12 +513,18 @@ class TiebaCrawler:
                     ),
                 )
 
-            saved = database.publish_job_threads(
-                job_id, request.first_floor_image_filter
+            saved = await asyncio.to_thread(
+                database.publish_job_threads,
+                job_id,
+                request.first_floor_image_filter,
+                preserve_tids=set(failed_threads),
             )
             has_incomplete_results = bool(final_failed or image_failed_count)
             final_status = "partial" if has_incomplete_results else "completed"
             completion = "部分完成" if has_incomplete_results else "抓取完成"
+            preserved_note = (
+                "，失败主题已尽量保留上次数据" if failed_threads else ""
+            )
             database.update_job(
                 job_id,
                 status=final_status,
@@ -510,7 +541,7 @@ class TiebaCrawler:
                     f"{completion}，扫描 {found} 条，首楼成功 {len(snapshot)} 条，"
                     f"缓存复用 {detail_cache_count} 条，跳过已删除 {len(skipped_threads)} 条，"
                     f"主题失败 {final_failed} 条，图片未识别 {image_failed_count} 张，"
-                    f"符合条件 {saved} 条"
+                    f"符合条件 {saved} 条{preserved_note}"
                 ),
                 finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
@@ -561,6 +592,9 @@ class TiebaCrawler:
             content = cached["content"]
             author_name = cached["author_name"]
             all_images = cached["images"]
+            all_thumbs = cached.get("image_thumbs") or list(all_images)
+            if len(all_thumbs) != len(all_images):
+                all_thumbs = list(all_images)
             retries = 0
             cache_hit = 1
         else:
@@ -573,7 +607,9 @@ class TiebaCrawler:
             detail_thread = getattr(details, "thread", None)
             content_source = first_floor or detail_thread or thread
             contents = getattr(content_source, "contents", None)
-            all_images = _image_urls(contents)
+            image_entries = _image_entries(contents)
+            all_images = [origin_url for origin_url, _ in image_entries]
+            all_thumbs = [thumbnail_url for _, thumbnail_url in image_entries]
             content = (
                 getattr(content_source, "text", "")
                 or getattr(contents, "text", "")
@@ -597,6 +633,7 @@ class TiebaCrawler:
             "has_images": bool(all_images),
             "is_portrait": False,
             "images": all_images,
+            "image_thumbs": all_thumbs,
             "source_url": f"https://tieba.baidu.com/p/{tid}",
             "job_id": job_id,
             "_detail_retries": retries,

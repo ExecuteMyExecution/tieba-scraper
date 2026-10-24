@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -10,24 +11,116 @@ from typing import Any, Iterator
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "tieba.db"
+BACKUP_KEEP = 5
+
+
+def _json_list(value: Any) -> list[Any]:
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _image_list(value: Any) -> list[str]:
+    return [str(url) for url in _json_list(value) if url]
+
+
+def _normalized_thumbs(item: dict[str, Any]) -> list[str]:
+    """Keep thumbnail URLs aligned with the original image list."""
+    images = [str(url) for url in (item.get("images") or [])]
+    thumbs = list(item.get("image_thumbs") or [])
+    if len(thumbs) != len(images):
+        return images
+    return [
+        str(thumb) if thumb else image
+        for thumb, image in zip(thumbs, images)
+    ]
+
+
+def _aligned_thumbs(raw: Any, images: list[str]) -> list[str]:
+    thumbs = _json_list(raw)
+    if len(thumbs) != len(images):
+        # Older rows have no thumbnail column value; callers use originals.
+        return []
+    return [
+        str(thumb) if thumb else image
+        for thumb, image in zip(thumbs, images)
+    ]
+
+
+_connection_state = threading.local()
+
+
+def _get_connection() -> sqlite3.Connection:
+    """Return a persistent connection for the current thread and DB path."""
+    path = str(DB_PATH)
+    state = getattr(_connection_state, "value", None)
+    if state is not None and state[0] == path:
+        return state[1]
+    if state is not None:
+        try:
+            state[1].close()
+        except sqlite3.Error:
+            pass
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DB_PATH, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA foreign_keys=ON")
+    _connection_state.value = (path, connection)
+    return connection
 
 
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DB_PATH, timeout=30)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA foreign_keys=ON")
+    connection = _get_connection()
     try:
         yield connection
         connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _backup_database() -> Path | None:
+    """Create a consistent SQLite backup before replacing visible data."""
+    if not DB_PATH.exists():
+        return None
+    backup_dir = DB_PATH.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    target = backup_dir / (
+        f"auto-{DB_PATH.stem}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.db"
+    )
+    source = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        destination = sqlite3.connect(target)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
     finally:
-        connection.close()
+        source.close()
+    backups = sorted(
+        backup_dir.glob(f"auto-{DB_PATH.stem}-*.db"),
+        key=lambda path: path.stat().st_mtime,
+    )
+    for old_backup in backups[:-BACKUP_KEEP]:
+        old_backup.unlink(missing_ok=True)
+    return target
+
+
+def count_forum_threads(forum_name: str) -> int:
+    with connect() as db:
+        row = db.execute(
+            "SELECT COUNT(*) FROM threads WHERE forum_name=?", (forum_name,)
+        ).fetchone()
+    return int(row[0]) if row else 0
 
 
 def initialize() -> None:
     with connect() as db:
+        db.execute("PRAGMA journal_mode=WAL")
         db.executescript(
             """
             CREATE TABLE IF NOT EXISTS jobs (
@@ -67,6 +160,7 @@ def initialize() -> None:
                 agree_count INTEGER NOT NULL DEFAULT 0,
                 has_images INTEGER NOT NULL DEFAULT 0,
                 images_json TEXT NOT NULL DEFAULT '[]',
+                image_thumbs_json TEXT NOT NULL DEFAULT '[]',
                 source_url TEXT NOT NULL,
                 fetched_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
                 job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL
@@ -87,7 +181,9 @@ def initialize() -> None:
                 agree_count INTEGER NOT NULL DEFAULT 0,
                 has_images INTEGER NOT NULL DEFAULT 0,
                 images_json TEXT NOT NULL DEFAULT '[]',
+                image_thumbs_json TEXT NOT NULL DEFAULT '[]',
                 portrait_images_json TEXT NOT NULL DEFAULT '[]',
+                portrait_thumbs_json TEXT NOT NULL DEFAULT '[]',
                 source_url TEXT NOT NULL,
                 fetched_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
                 PRIMARY KEY (job_id, tid)
@@ -103,6 +199,16 @@ def initialize() -> None:
             CREATE INDEX IF NOT EXISTS idx_threads_forum ON threads(forum_name);
             CREATE INDEX IF NOT EXISTS idx_threads_created ON threads(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_threads_author ON threads(author_name);
+            CREATE INDEX IF NOT EXISTS idx_threads_created_tid
+                ON threads(created_at DESC, tid DESC);
+            CREATE INDEX IF NOT EXISTS idx_threads_forum_created_tid
+                ON threads(forum_name, created_at DESC, tid DESC);
+            CREATE INDEX IF NOT EXISTS idx_threads_images_created_tid
+                ON threads(has_images, created_at DESC, tid DESC);
+            CREATE INDEX IF NOT EXISTS idx_threads_replies_created_tid
+                ON threads(reply_count DESC, created_at DESC, tid DESC);
+            CREATE INDEX IF NOT EXISTS idx_threads_views_created_tid
+                ON threads(view_count DESC, created_at DESC, tid DESC);
             CREATE INDEX IF NOT EXISTS idx_job_threads_job ON job_threads(job_id);
             CREATE INDEX IF NOT EXISTS idx_job_threads_tid_fetched
                 ON job_threads(tid, fetched_at DESC);
@@ -140,6 +246,24 @@ def initialize() -> None:
         if "image_failed_count" not in job_columns:
             db.execute(
                 "ALTER TABLE jobs ADD COLUMN image_failed_count INTEGER NOT NULL DEFAULT 0"
+            )
+        table_columns = {
+            table: {
+                row["name"]
+                for row in db.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for table in ("threads", "job_threads")
+        }
+        for table in ("threads", "job_threads"):
+            if "image_thumbs_json" not in table_columns[table]:
+                db.execute(
+                    f"ALTER TABLE {table} "
+                    "ADD COLUMN image_thumbs_json TEXT NOT NULL DEFAULT '[]'"
+                )
+        if "portrait_thumbs_json" not in table_columns["job_threads"]:
+            db.execute(
+                "ALTER TABLE job_threads "
+                "ADD COLUMN portrait_thumbs_json TEXT NOT NULL DEFAULT '[]'"
             )
         db.execute(
             "UPDATE jobs SET status='failed', message='服务重启，任务已中断', "
@@ -217,10 +341,11 @@ def get_cached_threads(
             placeholders = ",".join("?" for _ in batch)
             rows = db.execute(
                 f"""
-                SELECT tid, content, author_name, has_images, images_json, fetched_at
+                SELECT tid, content, author_name, has_images,
+                       images_json, image_thumbs_json, fetched_at
                 FROM (
-                    SELECT tid, content, author_name, has_images, images_json,
-                           fetched_at,
+                    SELECT tid, content, author_name, has_images,
+                           images_json, image_thumbs_json, fetched_at,
                            ROW_NUMBER() OVER (
                                PARTITION BY tid
                                ORDER BY fetched_at DESC, job_id DESC
@@ -237,7 +362,10 @@ def get_cached_threads(
             for row in rows:
                 item = dict(row)
                 tid = int(item.pop("tid"))
-                item["images"] = json.loads(item.pop("images_json") or "[]")
+                item["images"] = _image_list(item.pop("images_json"))
+                item["image_thumbs"] = _aligned_thumbs(
+                    item.pop("image_thumbs_json"), item["images"]
+                )
                 item["has_images"] = bool(item["has_images"])
                 result[tid] = item
     return result
@@ -293,8 +421,9 @@ def upsert_thread(item: dict[str, Any]) -> None:
             INSERT INTO threads (
                 tid, forum_name, title, content, author_name, author_id,
                 created_at, last_reply_at, reply_count, view_count, agree_count,
-                has_images, images_json, source_url, fetched_at, job_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'), ?)
+                has_images, images_json, image_thumbs_json, source_url,
+                fetched_at, job_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'), ?)
             ON CONFLICT(tid) DO UPDATE SET
                 forum_name=excluded.forum_name,
                 title=excluded.title,
@@ -308,6 +437,7 @@ def upsert_thread(item: dict[str, Any]) -> None:
                 agree_count=excluded.agree_count,
                 has_images=excluded.has_images,
                 images_json=excluded.images_json,
+                image_thumbs_json=excluded.image_thumbs_json,
                 source_url=excluded.source_url,
                 fetched_at=excluded.fetched_at,
                 job_id=excluded.job_id
@@ -317,8 +447,9 @@ def upsert_thread(item: dict[str, Any]) -> None:
                 item["author_name"], item["author_id"], item["created_at"],
                 item["last_reply_at"], item["reply_count"], item["view_count"],
                 item["agree_count"], int(item["has_images"]),
-                json.dumps(item["images"], ensure_ascii=False), item["source_url"],
-                item["job_id"],
+                json.dumps(item["images"], ensure_ascii=False),
+                json.dumps(_normalized_thumbs(item), ensure_ascii=False),
+                item["source_url"], item["job_id"],
             ),
         )
 
@@ -333,7 +464,9 @@ def stage_threads(job_id: int, items: list[dict[str, Any]]) -> None:
             item["author_name"], item["author_id"], item["created_at"],
             item["last_reply_at"], item["reply_count"], item["view_count"],
             item["agree_count"], int(item["has_images"]),
-            json.dumps(item["images"], ensure_ascii=False), item["source_url"],
+            json.dumps(item["images"], ensure_ascii=False),
+            json.dumps(_normalized_thumbs(item), ensure_ascii=False),
+            item["source_url"],
         )
         for item in items
     ]
@@ -343,8 +476,8 @@ def stage_threads(job_id: int, items: list[dict[str, Any]]) -> None:
             INSERT INTO job_threads (
                 job_id, tid, forum_name, title, content, author_name, author_id,
                 created_at, last_reply_at, reply_count, view_count, agree_count,
-                has_images, images_json, source_url, fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
+                has_images, images_json, image_thumbs_json, source_url, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
             ON CONFLICT(job_id, tid) DO UPDATE SET
                 forum_name=excluded.forum_name,
                 title=excluded.title,
@@ -358,6 +491,7 @@ def stage_threads(job_id: int, items: list[dict[str, Any]]) -> None:
                 agree_count=excluded.agree_count,
                 has_images=excluded.has_images,
                 images_json=excluded.images_json,
+                image_thumbs_json=excluded.image_thumbs_json,
                 source_url=excluded.source_url,
                 fetched_at=excluded.fetched_at
             """,
@@ -365,20 +499,46 @@ def stage_threads(job_id: int, items: list[dict[str, Any]]) -> None:
         )
 
 
-def set_portrait_matches(job_id: int, matches: dict[int, list[str]]) -> None:
+def set_portrait_matches(
+    job_id: int,
+    matches: dict[int, list[str]],
+    thumbs: dict[int, list[str]] | None = None,
+) -> None:
     """Attach portrait results to the exact snapshot that was classified."""
+    thumbs = thumbs or {}
+    values = []
+    for tid, urls in matches.items():
+        portrait_thumbs = list(thumbs.get(tid) or [])
+        if len(portrait_thumbs) != len(urls):
+            portrait_thumbs = list(urls)
+        values.append((
+            json.dumps(urls, ensure_ascii=False),
+            json.dumps(portrait_thumbs, ensure_ascii=False),
+            job_id,
+            tid,
+        ))
+    if not values:
+        return
     with connect() as db:
         db.executemany(
-            "UPDATE job_threads SET portrait_images_json=? WHERE job_id=? AND tid=?",
-            [
-                (json.dumps(urls, ensure_ascii=False), job_id, tid)
-                for tid, urls in matches.items()
-            ],
+            "UPDATE job_threads "
+            "SET portrait_images_json=?, portrait_thumbs_json=? "
+            "WHERE job_id=? AND tid=?",
+            values,
         )
 
 
-def publish_job_threads(job_id: int, image_filter: str) -> int:
-    """Replace only this forum's visible rows, preserving other forums."""
+def publish_job_threads(
+    job_id: int,
+    image_filter: str,
+    preserve_tids: set[int] | None = None,
+) -> int:
+    """Replace this forum's visible rows while keeping unresolved old rows.
+
+    ``preserve_tids`` is used for topics whose detail could not be fetched in
+    this run. Keeping their previous snapshots avoids deleting data merely
+    because a request was rate-limited or failed temporarily.
+    """
     filters = {
         "all": "1=1",
         "with_images": "has_images=1",
@@ -388,31 +548,71 @@ def publish_job_threads(job_id: int, image_filter: str) -> int:
     condition = filters.get(image_filter, filters["all"])
     portrait_mode = image_filter == "portrait_images"
     images_expression = "portrait_images_json" if portrait_mode else "images_json"
+    thumbs_expression = "portrait_thumbs_json" if portrait_mode else "image_thumbs_json"
     has_images_expression = "1" if portrait_mode else "has_images"
+    preserve_tids = sorted({int(tid) for tid in (preserve_tids or [])})
     with connect() as db:
         job = db.execute(
             "SELECT forum_name FROM jobs WHERE id=?", (job_id,)
         ).fetchone()
         if job is None:
             raise ValueError(f"任务 #{job_id} 不存在")
-        db.execute("DELETE FROM threads WHERE forum_name=?", (job["forum_name"],))
+        forum_name = job["forum_name"]
+        existing_count = db.execute(
+            "SELECT COUNT(*) FROM threads WHERE forum_name=?", (forum_name,)
+        ).fetchone()[0]
+        new_count = db.execute(
+            f"SELECT COUNT(*) FROM job_threads WHERE job_id=? AND {condition}",
+            (job_id,),
+        ).fetchone()[0]
+        if existing_count and new_count == 0:
+            raise ValueError("本次没有可发布的主题，已保留该吧原数据")
+        if existing_count:
+            _backup_database()
+        if preserve_tids:
+            db.execute("DROP TABLE IF EXISTS temp.preserve_tids")
+            db.execute(
+                "CREATE TEMP TABLE preserve_tids (tid INTEGER PRIMARY KEY)"
+            )
+            db.executemany(
+                "INSERT OR IGNORE INTO preserve_tids(tid) VALUES (?)",
+                [(tid,) for tid in preserve_tids],
+            )
+            db.execute("DROP TABLE IF EXISTS temp.preserved_threads")
+            db.execute(
+                """
+                CREATE TEMP TABLE preserved_threads AS
+                SELECT threads.*
+                FROM threads
+                JOIN preserve_tids ON preserve_tids.tid = threads.tid
+                WHERE threads.forum_name=?
+                """,
+                (forum_name,),
+            )
+        db.execute("DELETE FROM threads WHERE forum_name=?", (forum_name,))
         cursor = db.execute(
             f"""
             INSERT INTO threads (
                 tid, forum_name, title, content, author_name, author_id,
                 created_at, last_reply_at, reply_count, view_count, agree_count,
-                has_images, images_json, source_url, fetched_at, job_id
+                has_images, images_json, image_thumbs_json, source_url, fetched_at, job_id
             )
             SELECT
                 tid, forum_name, title, content, author_name, author_id,
                 created_at, last_reply_at, reply_count, view_count, agree_count,
-                {has_images_expression}, {images_expression}, source_url,
-                datetime('now', 'localtime'), job_id
+                {has_images_expression}, {images_expression}, {thumbs_expression},
+                source_url, datetime('now', 'localtime'), job_id
             FROM job_threads
             WHERE job_id=? AND {condition}
             """,
             (job_id,),
         )
+        if preserve_tids:
+            db.execute(
+                "INSERT OR IGNORE INTO threads SELECT * FROM preserved_threads"
+            )
+            db.execute("DROP TABLE preserved_threads")
+            db.execute("DROP TABLE preserve_tids")
         return max(cursor.rowcount, 0)
 
 
@@ -468,6 +668,7 @@ def search_threads(
     sort: str = "newest",
     page: int = 1,
     page_size: int = 20,
+    anchor_tid: int | None = None,
 ) -> dict[str, Any]:
     where: list[str] = []
     params: list[Any] = []
@@ -476,8 +677,8 @@ def search_threads(
         needle = f"%{query}%"
         params.extend([needle, needle])
     if forum:
-        where.append("forum_name LIKE ?")
-        params.append(f"%{forum}%")
+        where.append("forum_name = ?")
+        params.append(forum)
     if author:
         where.append("author_name LIKE ?")
         params.append(f"%{author}%")
@@ -501,18 +702,35 @@ def search_threads(
 
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     order_by = SORT_COLUMNS.get(sort, SORT_COLUMNS["newest"])
-    offset = (page - 1) * page_size
     with connect() as db:
-        total = db.execute(f"SELECT COUNT(*) FROM threads {clause}", params).fetchone()[0]
         summary_row = db.execute(
             f"""
-            SELECT COUNT(DISTINCT forum_name) forum_count,
+            SELECT COUNT(*) total,
+                   COUNT(DISTINCT forum_name) forum_count,
                    COUNT(DISTINCT job_id) job_count,
                    MIN(job_id) only_job_id
             FROM threads {clause}
             """,
             params,
         ).fetchone()
+        total = summary_row["total"]
+        if anchor_tid is not None:
+            # Keep the item the user was looking at on screen after filters
+            # changed. The client sends the nearest non-ignored card's tid.
+            anchor_row = db.execute(
+                f"""
+                WITH filtered AS (
+                    SELECT tid, ROW_NUMBER() OVER (ORDER BY {order_by}) AS position
+                    FROM threads {clause}
+                )
+                SELECT position FROM filtered WHERE tid=?
+                """,
+                (*params, anchor_tid),
+            ).fetchone()
+            if anchor_row is not None:
+                position = int(anchor_row["position"])
+                page = max(1, (position + page_size - 1) // page_size)
+        offset = (page - 1) * page_size
         rows = db.execute(
             f"SELECT * FROM threads {clause} ORDER BY {order_by} LIMIT ? OFFSET ?",
             (*params, page_size, offset),
@@ -521,7 +739,10 @@ def search_threads(
     items = []
     for row in rows:
         item = dict(row)
-        item["images"] = json.loads(item.pop("images_json") or "[]")
+        item["images"] = _image_list(item.pop("images_json"))
+        item["image_thumbs"] = _aligned_thumbs(
+            item.pop("image_thumbs_json", None), item["images"]
+        )
         items.append(item)
     return {
         "items": items,

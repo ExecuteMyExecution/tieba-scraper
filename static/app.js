@@ -12,15 +12,27 @@ const state = {
   cardWidth: 220,
   ignoredAuthors: [],
   collectorCollapsed: false,
+  galleryByTid: new Map(),
   lightboxImages: [],
+  lightboxThumbs: [],
   lightboxIndex: 0,
   lightboxTrigger: null,
+  lightboxLoadToken: 0,
+  lightboxCache: new Map(),
+  lightboxPrefetchTimer: null,
   threadLoadId: 0,
+  threadAbortController: null,
+  threadRenderToken: 0,
   preferencesReady: false,
 };
 
 let filterTimer = null;
+let preferencesTimer = null;
+let cardSizeFrame = null;
 const PREFERENCES_KEY = "tieba-content-desk-preferences-v1";
+const CARD_IMAGE_LIMIT = 5;
+const LIGHTBOX_CACHE_LIMIT = 4;
+const CARD_RENDER_CHUNK = 8;
 
 function savePreferences() {
   if (!state.preferencesReady) return;
@@ -82,13 +94,25 @@ const escapeHtml = (value = "") => String(value)
   .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
   .replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 
+const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
+  year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit",
+});
+const standardNumberFormatter = new Intl.NumberFormat("zh-CN", {
+  notation: "standard", maximumFractionDigits: 1,
+});
+const compactNumberFormatter = new Intl.NumberFormat("zh-CN", {
+  notation: "compact", maximumFractionDigits: 1,
+});
+
 function formatNumber(value) {
-  return new Intl.NumberFormat("zh-CN", { notation: value > 9999 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value || 0);
+  const number = Number(value) || 0;
+  return (number > 9999 ? compactNumberFormatter : standardNumberFormatter).format(number);
 }
 
 function formatDate(timestamp) {
   if (!timestamp) return "时间未知";
-  return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(timestamp * 1000));
+  return dateFormatter.format(new Date(timestamp * 1000));
 }
 
 function toast(message, error = false) {
@@ -131,7 +155,7 @@ async function loadForums(preferredForum = $("#filter-forum").value) {
   }
 }
 
-function queryParams() {
+function queryParams(anchorTid = null) {
   const params = new URLSearchParams({
     query: $("#query").value.trim(),
     forum: $("#filter-forum").value,
@@ -142,6 +166,7 @@ function queryParams() {
     page_size: state.pageSize,
   });
   state.ignoredAuthors.forEach((author) => params.append("exclude_author", author));
+  if (anchorTid) params.set("anchor_tid", String(anchorTid));
   return params;
 }
 
@@ -158,40 +183,80 @@ function renderIgnoredAuthors() {
   ).join("")}</div>`;
 }
 
-function ignoreAuthor(author) {
+function findAnchorCard(sourceCard, ignoredAuthor) {
+  const cards = [...document.querySelectorAll("#content-list .content-card")];
+  if (!cards.length) return null;
+  const isCandidate = (card) => card.dataset.author !== ignoredAuthor;
+  const index = sourceCard ? cards.indexOf(sourceCard) : -1;
+  if (index >= 0) {
+    for (let position = index; position < cards.length; position += 1) {
+      if (isCandidate(cards[position])) return cards[position];
+    }
+    for (let position = index - 1; position >= 0; position -= 1) {
+      if (isCandidate(cards[position])) return cards[position];
+    }
+    return null;
+  }
+  return cards.find(isCandidate) || null;
+}
+
+function restoreAnchorPosition(anchorTid, anchorTop) {
+  if (!anchorTid || !Number.isFinite(anchorTop)) return;
+  requestAnimationFrame(() => {
+    const card = [...document.querySelectorAll("#content-list .content-card")]
+      .find((element) => element.dataset.tid === String(anchorTid));
+    if (!card) return;
+    const delta = card.getBoundingClientRect().top - anchorTop;
+    if (Math.abs(delta) > 1) {
+      window.scrollBy({ top: delta, behavior: "instant" });
+    }
+  });
+}
+
+function ignoreAuthor(author, sourceCard = null) {
   const normalized = String(author || "").trim();
   if (!normalized || state.ignoredAuthors.includes(normalized)) return;
   if (state.ignoredAuthors.length >= 100) {
     toast("最多可屏蔽 100 位作者", true);
     return;
   }
+  const anchor = findAnchorCard(sourceCard, normalized);
+  const anchorTid = anchor?.dataset.tid || null;
+  const anchorTop = anchor ? anchor.getBoundingClientRect().top : null;
   state.ignoredAuthors.push(normalized);
   renderIgnoredAuthors();
-  state.page = 1;
   savePreferences();
-  loadThreads();
+  loadThreads({ anchorTid, anchorTop });
   toast(`已不看“${normalized}”的帖子`);
 }
 
 function unignoreAuthor(author) {
+  const anchor = findAnchorCard(null, null);
+  const anchorTid = anchor?.dataset.tid || null;
+  const anchorTop = anchor ? anchor.getBoundingClientRect().top : null;
   state.ignoredAuthors = state.ignoredAuthors.filter((name) => name !== author);
   renderIgnoredAuthors();
-  state.page = 1;
   savePreferences();
-  loadThreads();
+  loadThreads({ anchorTid, anchorTop });
 }
 
 function renderCard(item) {
-  const gallery = item.images || [];
+  const gallery = Array.isArray(item.images) ? item.images : [];
+  const thumbs = Array.isArray(item.image_thumbs) ? item.image_thumbs : [];
+  const tid = String(item.tid ?? "");
+  if (tid) state.galleryByTid.set(tid, { images: gallery, thumbs });
   const authorName = String(item.author_name || "").trim();
-  const galleryData = escapeHtml(JSON.stringify(gallery));
-  const images = gallery.slice(0, 5).map((src, index) =>
-    `<button class="image-preview" type="button" data-gallery="${galleryData}" data-index="${index}" aria-label="查看第 ${index + 1} 张大图"><img src="${escapeHtml(src)}" alt="帖子图片" loading="lazy" referrerpolicy="no-referrer"></button>`
-  ).join("");
+  const images = gallery.slice(0, CARD_IMAGE_LIMIT).map((src, index) => {
+    const thumbnail = thumbs[index] || src;
+    const fallback = thumbnail !== src
+      ? ` data-fallback-src="${escapeHtml(src)}"`
+      : "";
+    return `<button class="image-preview" type="button" data-tid="${escapeHtml(tid)}" data-index="${index}" aria-label="查看第 ${index + 1} 张大图"><img src="${escapeHtml(thumbnail)}"${fallback} alt="帖子图片" loading="lazy" decoding="async" fetchpriority="low" referrerpolicy="no-referrer"></button>`;
+  }).join("");
   const ignoreAuthorButton = authorName
     ? `<button class="ignore-author-button" type="button" data-ignore-author="${escapeHtml(authorName)}" title="不再显示 ${escapeHtml(authorName)} 的帖子">不看此作者</button>`
     : "";
-  return `<article class="content-card">
+  return `<article class="content-card" data-tid="${escapeHtml(tid)}" data-author="${escapeHtml(authorName)}">
     <div class="card-top">
       <span class="forum-pill">${escapeHtml(item.forum_name)}吧</span>
       ${item.has_images ? '<span class="image-pill">含图片</span>' : ''}
@@ -211,30 +276,132 @@ function renderCard(item) {
   </article>`;
 }
 
+function clearLightboxCache() {
+  clearTimeout(state.lightboxPrefetchTimer);
+  state.lightboxPrefetchTimer = null;
+  state.lightboxLoadToken += 1;
+  state.lightboxCache.clear();
+  $("#lightbox-image").removeAttribute("src");
+}
+
+function cacheLightboxLoader(url, loader) {
+  if (!url) return;
+  state.lightboxCache.delete(url);
+  state.lightboxCache.set(url, loader);
+  while (state.lightboxCache.size > LIGHTBOX_CACHE_LIMIT) {
+    state.lightboxCache.delete(state.lightboxCache.keys().next().value);
+  }
+}
+
+function getLightboxLoader(url) {
+  const cached = state.lightboxCache.get(url);
+  if (cached) return cached;
+  const loader = new Image();
+  loader.decoding = "async";
+  loader.src = url;
+  cacheLightboxLoader(url, loader);
+  return loader;
+}
+
+function waitForImage(loader) {
+  if (loader.complete) {
+    return loader.naturalWidth > 0
+      ? Promise.resolve()
+      : Promise.reject(new Error("图片加载失败"));
+  }
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      loader.removeEventListener("load", onLoad);
+      loader.removeEventListener("error", onError);
+    };
+    const onLoad = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error("图片加载失败"));
+    };
+    loader.addEventListener("load", onLoad);
+    loader.addEventListener("error", onError);
+  });
+}
+
+async function upgradeLightboxImage(url, token) {
+  if (!url) return;
+  const loader = getLightboxLoader(url);
+  try {
+    await waitForImage(loader);
+    if (typeof loader.decode === "function") await loader.decode();
+  } catch {
+    // Keep showing the already-decoded thumbnail when the original fails and
+    // drop the failed loader so reopening the image can retry.
+    state.lightboxCache.delete(url);
+    return;
+  }
+  if (token !== state.lightboxLoadToken) return;
+  $("#lightbox-image").src = url;
+  $("#lightbox-image").classList.remove("loading");
+  $(".lightbox-dialog").classList.remove("loading");
+  cacheLightboxLoader(url, loader);
+}
+
+function scheduleLightboxPrefetch(index) {
+  clearTimeout(state.lightboxPrefetchTimer);
+  state.lightboxPrefetchTimer = setTimeout(() => {
+    if ($("#lightbox").classList.contains("hidden")) return;
+    const total = state.lightboxImages.length;
+    if (total < 2 || navigator.connection?.saveData) return;
+    const nextUrl = state.lightboxImages[(index + 1) % total];
+    if (nextUrl && nextUrl !== state.lightboxImages[index]) {
+      getLightboxLoader(nextUrl);
+    }
+  }, 700);
+}
+
 function renderLightbox() {
   const total = state.lightboxImages.length;
   if (!total) return;
-  $("#lightbox-image").src = state.lightboxImages[state.lightboxIndex];
-  $("#lightbox-counter").textContent = `${state.lightboxIndex + 1} / ${total}`;
+  const index = state.lightboxIndex;
+  const fullImage = state.lightboxImages[index];
+  const thumbnail = state.lightboxThumbs[index] || fullImage;
+  const token = ++state.lightboxLoadToken;
+  const image = $("#lightbox-image");
+  if (image.getAttribute("src") !== thumbnail) {
+    image.src = thumbnail;
+  }
+  const visible = image.complete && image.naturalWidth > 0;
+  image.classList.toggle("loading", !visible);
+  $(".lightbox-dialog").classList.toggle("loading", !visible);
+  $("#lightbox-counter").textContent = `${index + 1} / ${total}`;
   $("#lightbox-prev").disabled = total < 2;
   $("#lightbox-next").disabled = total < 2;
+  if (fullImage && fullImage !== thumbnail) {
+    void upgradeLightboxImage(fullImage, token);
+  }
+  scheduleLightboxPrefetch(index);
 }
 
-function openLightbox(images, index, trigger) {
-  state.lightboxImages = images;
+function openLightbox(gallery, index, trigger) {
+  state.lightboxImages = gallery.images || [];
+  state.lightboxThumbs = gallery.thumbs || [];
   state.lightboxIndex = index;
   state.lightboxTrigger = trigger;
   renderLightbox();
   $("#lightbox").classList.remove("hidden");
   document.body.classList.add("lightbox-open");
-  $("#lightbox-close").focus();
+  $("#lightbox-close").focus({ preventScroll: true });
 }
 
 function closeLightbox() {
+  state.lightboxLoadToken += 1;
+  clearTimeout(state.lightboxPrefetchTimer);
+  state.lightboxPrefetchTimer = null;
   $("#lightbox").classList.add("hidden");
   document.body.classList.remove("lightbox-open");
-  $("#lightbox-image").removeAttribute("src");
-  if (state.lightboxTrigger) state.lightboxTrigger.focus();
+  if (state.lightboxTrigger) {
+    state.lightboxTrigger.focus({ preventScroll: true });
+  }
 }
 
 function moveLightbox(step) {
@@ -244,13 +411,42 @@ function moveLightbox(step) {
   renderLightbox();
 }
 
-async function loadThreads() {
+function renderThreadCards(items, onDone) {
+  const list = $("#content-list");
+  const token = ++state.threadRenderToken;
+  list.replaceChildren();
+  let index = 0;
+  const renderChunk = () => {
+    if (token !== state.threadRenderToken) return;
+    const chunk = items.slice(index, index + CARD_RENDER_CHUNK);
+    if (chunk.length) {
+      list.insertAdjacentHTML("beforeend", chunk.map(renderCard).join(""));
+      index += chunk.length;
+    }
+    if (index < items.length) {
+      requestAnimationFrame(renderChunk);
+    } else if (onDone) {
+      onDone();
+    }
+  };
+  renderChunk();
+}
+
+async function loadThreads({ anchorTid = null, anchorTop = null } = {}) {
   const loadId = ++state.threadLoadId;
+  const controller = new AbortController();
+  if (state.threadAbortController) state.threadAbortController.abort();
+  state.threadAbortController = controller;
   const list = $("#content-list");
   list.style.opacity = ".55";
   try {
-    const data = await api(`/api/threads?${queryParams()}`);
+    const data = await api(`/api/threads?${queryParams(anchorTid)}`, {
+      signal: controller.signal,
+    });
     if (loadId !== state.threadLoadId) return;
+    if (Number.isInteger(data.page) && data.page > 0) {
+      state.page = data.page;
+    }
     state.total = data.total;
     const totalPages = Math.max(1, Math.ceil(data.total / state.pageSize));
     if (data.total > 0 && state.page > totalPages) {
@@ -258,7 +454,12 @@ async function loadThreads() {
       await loadThreads();
       return;
     }
-    list.innerHTML = data.items.map(renderCard).join("");
+    state.galleryByTid = new Map();
+    if ($("#lightbox").classList.contains("hidden")) clearLightboxCache();
+    renderThreadCards(
+      data.items,
+      () => restoreAnchorPosition(anchorTid, anchorTop),
+    );
     $("#empty-state").classList.toggle("hidden", data.items.length > 0);
     $("#result-summary").textContent = data.job_id
       ? `共找到 ${data.total} 条内容 · 任务 #${data.job_id}`
@@ -275,6 +476,7 @@ async function loadThreads() {
     $("#prev-page").disabled = state.page <= 1;
     $("#next-page").disabled = state.page >= totalPages;
   } catch (error) {
+    if (error.name === "AbortError") return;
     if (loadId === state.threadLoadId) toast(error.message, true);
   } finally {
     if (loadId === state.threadLoadId) list.style.opacity = "1";
@@ -388,8 +590,8 @@ $("#crawl-form").addEventListener("submit", async (event) => {
 
 function scheduleFilter(delay = 0) {
   clearTimeout(filterTimer);
-  savePreferences();
   filterTimer = setTimeout(() => {
+    savePreferences();
     state.page = 1;
     loadThreads();
   }, delay);
@@ -415,6 +617,11 @@ $("#filter-reset").addEventListener("click", () => {
   savePreferences();
   loadThreads();
 });
+
+function savePreferencesSoon() {
+  clearTimeout(preferencesTimer);
+  preferencesTimer = setTimeout(savePreferences, 250);
+}
 
 function setCollectorCollapsed(collapsed) {
   state.collectorCollapsed = collapsed;
@@ -452,10 +659,14 @@ function setCardSize(width) {
   $("#card-size-output").textContent = `${value}px`;
   $("#card-size-smaller").disabled = value <= Number(range.min);
   $("#card-size-larger").disabled = value >= Number(range.max);
-  $("#content-list").style.setProperty("--card-min-width", `${value}px`);
-  $("#content-list").style.setProperty("--preview-width", `${previewWidth}px`);
-  $("#content-list").style.setProperty("--preview-height", `${previewHeight}px`);
-  savePreferences();
+  if (cardSizeFrame) cancelAnimationFrame(cardSizeFrame);
+  cardSizeFrame = requestAnimationFrame(() => {
+    cardSizeFrame = null;
+    $("#content-list").style.setProperty("--card-min-width", `${value}px`);
+    $("#content-list").style.setProperty("--preview-width", `${previewWidth}px`);
+    $("#content-list").style.setProperty("--preview-height", `${previewHeight}px`);
+    savePreferencesSoon();
+  });
 }
 
 function scrollToCardTop() {
@@ -478,13 +689,26 @@ $("#card-size-larger").addEventListener("click", () => setCardSize(state.cardWid
 $("#content-list").addEventListener("click", (event) => {
   const ignoreButton = event.target.closest("[data-ignore-author]");
   if (ignoreButton) {
-    ignoreAuthor(ignoreButton.dataset.ignoreAuthor);
+    ignoreAuthor(
+      ignoreButton.dataset.ignoreAuthor,
+      ignoreButton.closest(".content-card"),
+    );
     return;
   }
   const preview = event.target.closest(".image-preview");
   if (!preview) return;
-  openLightbox(JSON.parse(preview.dataset.gallery), Number(preview.dataset.index), preview);
+  const gallery = state.galleryByTid.get(preview.dataset.tid);
+  if (!gallery) return;
+  openLightbox(gallery, Number(preview.dataset.index), preview);
 });
+$("#content-list").addEventListener("error", (event) => {
+  const image = event.target;
+  if (!(image instanceof HTMLImageElement)) return;
+  const fallback = image.dataset.fallbackSrc;
+  if (!fallback || image.dataset.fallbackApplied === "1") return;
+  image.dataset.fallbackApplied = "1";
+  image.src = fallback;
+}, true);
 $("#ignored-authors").addEventListener("click", (event) => {
   const button = event.target.closest("[data-unignore-author]");
   if (button) unignoreAuthor(button.dataset.unignoreAuthor);
@@ -493,6 +717,20 @@ $("#lightbox-mask").addEventListener("click", closeLightbox);
 $("#lightbox-close").addEventListener("click", closeLightbox);
 $("#lightbox-prev").addEventListener("click", () => moveLightbox(-1));
 $("#lightbox-next").addEventListener("click", () => moveLightbox(1));
+$("#lightbox-image").addEventListener("load", () => {
+  $("#lightbox-image").classList.remove("loading");
+  $(".lightbox-dialog").classList.remove("loading");
+});
+$("#lightbox-image").addEventListener("error", () => {
+  $("#lightbox-image").classList.remove("loading");
+  $(".lightbox-dialog").classList.remove("loading");
+});
+$("#lightbox").addEventListener("wheel", (event) => {
+  event.preventDefault();
+}, { passive: false });
+$("#lightbox").addEventListener("touchmove", (event) => {
+  event.preventDefault();
+}, { passive: false });
 $("#cancel-job-button").addEventListener("click", async () => {
   if (!state.activeJobId) return;
   const button = $("#cancel-job-button");
@@ -513,7 +751,13 @@ document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") closeLightbox();
     if (event.key === "ArrowLeft") moveLightbox(-1);
     if (event.key === "ArrowRight") moveLightbox(1);
-    if (["Escape", "ArrowLeft", "ArrowRight"].includes(event.key)) {
+    const activating = event.key === " "
+      && event.target instanceof HTMLElement
+      && Boolean(event.target.closest("button, a"));
+    if (!activating && [
+      "Escape", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown",
+      "PageUp", "PageDown", "Home", "End", " ",
+    ].includes(event.key)) {
       event.preventDefault();
     }
     return;
